@@ -7,7 +7,7 @@ Gem::Specification.new do |s|
   s.version     = Popcornjs::Rails::VERSION
   s.authors     = ["Jaimie van Santen"]
   s.email       = ["rhoxus@gmail.com"]
-  s.homepage    = "https://github.com/jaimie-van-santen/popcorn-js"
+  s.homepage    = "https://github.com/jaimie-van-santen/popcornjs-rails"
   s.summary     = %q{popcorn.js asset pipeline provider/wrapper}
   s.description = %q{Simple wrapper for HTML5 Video library popcorn.js}
 
