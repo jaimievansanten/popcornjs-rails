@@ -9,16 +9,16 @@ Rails 3.1 asset-pipeline gem to provide popcorn.js support
 
 In your application.js manifest:
 
-## For full version:
+## Core version:
 	//= popcorn
 
-## Minified
+## Core version (minified)
 	//= popcorn.min
 
-## Full with all plugins
+## Full version with all plugins
 	//= popcorn-complete
 
-## Full with all plugins and minified
+## Full version with all plugins (minified)
 	//= popcorn-complete.min
 
 or directly available under `/assets/popcorn.js`
