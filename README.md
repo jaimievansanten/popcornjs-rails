@@ -21,5 +21,11 @@ In your application.js manifest:
 ## Full version with all plugins (minified)
 	//= popcorn-complete.min
 
+## Beta: The Popcorn.js core library, plus IE8 shim, flash player support, and the YouTube player
+  //= popcorn-ie8
+
+## Beta: The Popcorn.js core library, plus IE8 shim, flash player support, and the YouTube player (minified)
+  //= popcorn-ie8.min
+
 or directly available under `/assets/popcorn.js`
 
