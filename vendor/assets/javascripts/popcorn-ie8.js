@@ -1,5 +1,5 @@
 /*
- * popcorn.js version 1.2
+ * popcorn.js version 1.3
  * http://popcornjs.org
  *
  * Copyright 2011, Mozilla Foundation
@@ -206,8 +206,7 @@
       isSupported: false
     };
 
-    var methods = ( "removeInstance addInstance getInstanceById removeInstanceById " +
-          "forEach extend effects error guid sizeOf isArray nop position disable enable destroy" +
+    var methods = ( "byId forEach extend effects error guid sizeOf isArray nop position disable enable destroy" +
           "addTrackEvent removeTrackEvent getTrackEvents getTrackEvent getLastTrackEventId " +
           "timeUpdate plugin removePlugin compose effect xhr getJSONP getScript" ).split(/\s+/);
 
@@ -229,9 +228,6 @@
 
   // Copy global Popcorn (may not exist)
   _Popcorn = global.Popcorn,
-
-  //  ID string matching
-  rIdExp  = /^(#([\w\-\_\.]+))$/,
 
   //  Ready fn cache
   readyStack = [],
@@ -274,61 +270,6 @@
     })( obj );
   },
 
-  refresh = function( obj ) {
-    var currentTime = obj.media.currentTime,
-      animation = obj.options.frameAnimation,
-      disabled = obj.data.disabled,
-      tracks = obj.data.trackEvents,
-      animating = tracks.animating,
-      start = tracks.startIndex,
-      registryByName = Popcorn.registryByName,
-      animIndex = 0,
-      byStart, natives, type;
-
-    start = Math.min( start + 1, tracks.byStart.length - 2 );
-
-    while ( start > 0 && tracks.byStart[ start ] ) {
-
-      byStart = tracks.byStart[ start ];
-      natives = byStart._natives;
-      type = natives && natives.type;
-
-      if ( !natives ||
-          ( !!registryByName[ type ] || !!obj[ type ] ) ) {
-
-        if ( ( byStart.start <= currentTime && byStart.end > currentTime ) &&
-                disabled.indexOf( type ) === -1 ) {
-
-          if ( !byStart._running ) {
-            byStart._running = true;
-            natives.start.call( obj, null, byStart );
-
-            // if the 'frameAnimation' option is used,
-            // push the current byStart object into the `animating` cue
-            if ( animation &&
-                ( byStart && byStart._running && byStart.natives.frame ) ) {
-
-              natives.frame.call( obj, null, byStart, currentTime );
-            }
-          }
-        } else if ( byStart._running === true ) {
-
-          byStart._running = false;
-          natives.end.call( obj, null, byStart );
-
-          if ( animation && byStart._natives.frame ) {
-            animIndex = animating.indexOf( byStart );
-            if ( animIndex >= 0 ) {
-              animating.splice( animIndex, 1 );
-            }
-          }
-        }
-      }
-
-      start--;
-    }
-  },
-
   //  Declare constructor
   //  Returns an instance object.
   Popcorn = function( entity, options ) {
@@ -337,7 +278,7 @@
   };
 
   //  Popcorn API version, automatically inserted via build system.
-  Popcorn.version = "1.2";
+  Popcorn.version = "1.3";
 
   //  Boolean flag allowing a client to determine if Popcorn can be supported
   Popcorn.isSupported = true;
@@ -351,7 +292,7 @@
 
     init: function( entity, options ) {
 
-      var matches,
+      var matches, nodeName,
           self = this;
 
       //  Supports Popcorn(function () { /../ })
@@ -399,31 +340,47 @@
         return;
       }
 
-      //  Check if entity is a valid string id
-      matches = rIdExp.exec( entity );
+      if ( typeof entity === "string" ) {
+        try {
+          matches = document.querySelector( entity );
+        } catch( e ) {
+          throw new Error( "Popcorn.js Error: Invalid media element selector: " + entity );
+        }
+      }
 
       //  Get media element by id or object reference
-      this.media = matches && matches.length && matches[ 2 ] ?
-                     document.getElementById( matches[ 2 ] ) :
-                     entity;
+      this.media = matches || entity;
+
+      //  inner reference to this media element's nodeName string value
+      nodeName = ( this.media.nodeName && this.media.nodeName.toLowerCase() ) || "video";
 
       //  Create an audio or video element property reference
-      this[ ( this.media.nodeName && this.media.nodeName.toLowerCase() ) || "video" ] = this.media;
-
-      //  Register new instance
-      Popcorn.instances.push( this );
+      this[ nodeName ] = this.media;
 
       this.options = options || {};
+
+      //  Resolve custom ID or default prefixed ID
+      this.id = this.options.id || Popcorn.guid( nodeName );
+
+      //  Throw if an attempt is made to use an ID that already exists
+      if ( Popcorn.byId( this.id ) ) {
+        throw new Error( "Popcorn.js Error: Cannot use duplicate ID (" + this.id + ")" );
+      }
 
       this.isDestroyed = false;
 
       this.data = {
 
+        // data structure of all
+        running: {
+          cue: []
+        },
+
         // Executed by either timeupdate event or in rAF loop
         timeUpdate: Popcorn.nop,
 
         // Allows disabling a plugin per instance
-        disabled: [],
+        disabled: {},
 
         // Stores DOM event queues by type
         events: {},
@@ -460,12 +417,26 @@
         }
       };
 
+      //  Register new instance
+      Popcorn.instances.push( this );
+
       //  function to fire when video is ready
       var isReady = function() {
 
+        // chrome bug: http://code.google.com/p/chromium/issues/detail?id=119598
+        // it is possible the video's time is less than 0
+        // this has the potential to call track events more than once, when they should not
+        // start: 0, end: 1 will start, end, start again, when it should just start
+        // just setting it to 0 if it is below 0 fixes this issue
+        if ( self.media.currentTime < 0 ) {
+
+          self.media.currentTime = 0;
+        }
+
         self.media.removeEventListener( "loadeddata", isReady, false );
 
-        var duration, videoDurationPlus;
+        var duration, videoDurationPlus,
+            runningPlugins, runningPlugin, rpLength, rpNatives;
 
         //  Adding padding to the front and end of the arrays
         //  this is so we do not fall off either end
@@ -480,6 +451,7 @@
         });
 
         if ( self.options.frameAnimation ) {
+
           //  if Popcorn is created with frameAnimation option set to true,
           //  requestAnimFrame is used instead of "timeupdate" media event.
           //  This is for greater frame time accuracy, theoretically up to
@@ -487,6 +459,25 @@
           self.data.timeUpdate = function () {
 
             Popcorn.timeUpdate( self, {} );
+
+            // fire frame for each enabled active plugin of every type
+            Popcorn.forEach( Popcorn.manifest, function( key, val ) {
+
+              runningPlugins = self.data.running[ val ];
+
+              // ensure there are running plugins on this type on this instance
+              if ( runningPlugins ) {
+
+                rpLength = runningPlugins.length;
+                for ( var i = 0; i < rpLength; i++ ) {
+
+                  runningPlugin = runningPlugins[ i ];
+                  rpNatives = runningPlugin._natives;
+                  rpNatives && rpNatives.frame &&
+                    rpNatives.frame.call( self, {}, runningPlugin, self.currentTime() );
+                }
+              }
+            });
 
             self.emit( "timeupdate" );
 
@@ -507,6 +498,13 @@
         }
       };
 
+      Object.defineProperty( this, "error", {
+        get: function() {
+
+          return self.media.error;
+        }
+      });
+
       if ( self.media.readyState >= 2 ) {
 
         isReady();
@@ -522,6 +520,20 @@
   //  Extend constructor prototype to instance prototype
   //  Allows chaining methods to instances
   Popcorn.p.init.prototype = Popcorn.p;
+
+  Popcorn.byId = function( str ) {
+    var instances = Popcorn.instances,
+        length = instances.length,
+        i = 0;
+
+    for ( ; i < length; i++ ) {
+      if ( instances[ i ].id === str ) {
+        return instances[ i ];
+      }
+    }
+
+    return null;
+  };
 
   Popcorn.forEach = function( obj, fn, context ) {
 
@@ -628,32 +640,38 @@
 
     disable: function( instance, plugin ) {
 
-      var disabled = instance.data.disabled;
+      if ( !instance.data.disabled[ plugin ] ) {
 
-      if ( disabled.indexOf( plugin ) === -1 ) {
-        disabled.push( plugin );
+        instance.data.disabled[ plugin ] = true;
+
+        for ( var i = instance.data.running[ plugin ].length - 1, event; i >= 0; i-- ) {
+
+          event = instance.data.running[ plugin ][ i ];
+          event._natives.end.call( instance, null, event  );
+        }
       }
-
-      refresh( instance );
 
       return instance;
     },
     enable: function( instance, plugin ) {
 
-      var disabled = instance.data.disabled,
-          index = disabled.indexOf( plugin );
+      if ( instance.data.disabled[ plugin ] ) {
 
-      if ( index > -1 ) {
-        disabled.splice( index, 1 );
+        instance.data.disabled[ plugin ] = false;
+
+        for ( var i = instance.data.running[ plugin ].length - 1, event; i >= 0; i-- ) {
+
+          event = instance.data.running[ plugin ][ i ];
+          event._natives.start.call( instance, null, event  );
+        }
       }
-
-      refresh( instance );
 
       return instance;
     },
     destroy: function( instance ) {
       var events = instance.data.events,
-          singleEvent, item, fn;
+          trackEvents = instance.data.trackEvents,
+          singleEvent, item, fn, plugin;
 
       //  Iterate through all events and remove them
       for ( item in events ) {
@@ -663,6 +681,15 @@
         }
         events[ item ] = null;
       }
+
+      // remove all plugins off the given instance
+      for ( plugin in Popcorn.registryByName ) {
+        Popcorn.removePlugin( instance, plugin );
+      }
+
+      // Remove all data.trackEvents #1178
+      trackEvents.byStart.length = 0;
+      trackEvents.byEnd.length = 0;
 
       if ( !instance.isDestroyed ) {
         instance.data.timeUpdate && instance.media.removeEventListener( "timeupdate", instance.data.timeUpdate, false );
@@ -688,6 +715,7 @@
       Popcorn.forEach( methods.split( /\s+/g ), function( name ) {
 
         ret[ name ] = function( arg ) {
+          var previous;
 
           if ( typeof this.media[ name ] === "function" ) {
 
@@ -704,11 +732,22 @@
             return this;
           }
 
-
           if ( arg != null ) {
+            // Capture the current value of the attribute property
+            previous = this.media[ name ];
 
+            // Set the attribute property with the new value
             this.media[ name ] = arg;
 
+            // If the new value is not the same as the old value
+            // emit an "attrchanged event"
+            if ( previous !== arg ) {
+              this.emit( "attrchange", {
+                attribute: name,
+                previousValue: previous,
+                currentValue: arg
+              });
+            }
             return this;
           }
 
@@ -731,14 +770,103 @@
 
     //  Rounded currentTime
     roundTime: function() {
-      return -~this.media.currentTime;
+      return Math.round( this.media.currentTime );
     },
 
     //  Attach an event to a single point in time
-    exec: function( time, fn ) {
+    exec: function( id, time, fn ) {
+      var length = arguments.length,
+          trackEvent, sec;
+
+      // Check if first could possibly be a SMPTE string
+      // p.cue( "smpte string", fn );
+      // try/catch avoid awful throw in Popcorn.util.toSeconds
+      // TODO: Get rid of that, replace with NaN return?
+      try {
+        sec = Popcorn.util.toSeconds( id );
+      } catch ( e ) {}
+
+      // If it can be converted into a number then
+      // it's safe to assume that the string was SMPTE
+      if ( typeof sec === "number" ) {
+        id = sec;
+      }
+
+      // Shift arguments based on use case
+      //
+      // Back compat for:
+      // p.cue( time, fn );
+      if ( typeof id === "number" && length === 2 ) {
+        fn = time;
+        time = id;
+        id = Popcorn.guid( "cue" );
+      } else {
+        // Support for new forms
+
+        // p.cue( "empty-cue" );
+        if ( length === 1 ) {
+          // Set a time for an empty cue. It's not important what
+          // the time actually is, because the cue is a no-op
+          time = -1;
+
+        } else {
+
+          // Get the trackEvent that matches the given id.
+          trackEvent = this.getTrackEvent( id );
+
+          if ( trackEvent ) {
+
+            // p.cue( "my-id", 12 );
+            // p.cue( "my-id", function() { ... });
+            if ( typeof id === "string" && length === 2 ) {
+
+              // p.cue( "my-id", 12 );
+              // The path will update the cue time.
+              if ( typeof time === "number" ) {
+                // Re-use existing trackEvent start callback
+                fn = trackEvent._natives.start;
+              }
+
+              // p.cue( "my-id", function() { ... });
+              // The path will update the cue function
+              if ( typeof time === "function" ) {
+                fn = time;
+                // Re-use existing trackEvent start time
+                time = trackEvent.start;
+              }
+            }
+          } else {
+
+            if ( length >= 2 ) {
+
+              // p.cue( "a", "00:00:00");
+              if ( typeof time === "string" ) {
+                try {
+                  sec = Popcorn.util.toSeconds( time );
+                } catch ( e ) {}
+
+                time = sec;
+              }
+
+              // p.cue( "b", 11 );
+              if ( typeof time === "number" ) {
+                fn = Popcorn.nop();
+              }
+
+              // p.cue( "c", function() {});
+              if ( typeof time === "function" ) {
+                fn = time;
+                time = -1;
+              }
+            }
+          }
+        }
+      }
 
       //  Creating a one second track event with an empty end
+      //  Or update an existing track event with new values
       Popcorn.addTrackEvent( this, {
+        id: id,
         start: time,
         end: time + 1,
         _running: false,
@@ -790,7 +918,7 @@
 
     // Toggle a plugin's playback behaviour (on or off) per instance
     toggle: function( plugin ) {
-      return Popcorn[ this.data.disabled.indexOf( plugin ) > -1 ? "enable" : "disable" ]( this, plugin );
+      return Popcorn[ this.data.disabled[ plugin ] ? "enable" : "disable" ]( this, plugin );
     },
 
     // Set default values for plugin options objects per instance
@@ -826,7 +954,7 @@
   Popcorn.Events  = {
     UIEvents: "blur focus focusin focusout load resize scroll unload",
     MouseEvents: "mousedown mouseup mousemove mouseover mouseout mouseenter mouseleave click dblclick",
-    Events: "loadstart progress suspend emptied stalled play pause " +
+    Events: "loadstart progress suspend emptied stalled play pause error " +
             "loadedmetadata loadeddata waiting playing canplay canplaythrough " +
             "seeking seeked timeupdate ended ratechange durationchange volumechange"
   };
@@ -1039,6 +1167,23 @@
 
   // Internal Only - Adds track events to the instance object
   Popcorn.addTrackEvent = function( obj, track ) {
+    var trackEvent, isUpdate, eventType;
+
+    // Do a lookup for existing trackevents with this id
+    if ( track.id ) {
+      trackEvent = obj.getTrackEvent( track.id );
+    }
+
+    // If a track event by this id currently exists, modify it
+    if ( trackEvent ) {
+      isUpdate = true;
+      // Create a new object with the existing trackEvent
+      // Extend with new track properties
+      track = Popcorn.extend( {}, trackEvent, track );
+
+      // Remove the existing track from the instance
+      obj.removeTrackEvent( track.id );
+    }
 
     // Determine if this track has default options set for it
     // If so, apply them to the track object
@@ -1050,7 +1195,7 @@
 
     if ( track._natives ) {
       //  Supports user defined track event id
-      track._id = !track.id ? Popcorn.guid( track._natives.type ) : track.id;
+      track._id = track.id || track._id || Popcorn.guid( track._natives.type );
 
       //  Push track event ids into the history
       obj.data.history.push( track._id );
@@ -1062,8 +1207,7 @@
     //  Store this definition in an array sorted by times
     var byStart = obj.data.trackEvents.byStart,
         byEnd = obj.data.trackEvents.byEnd,
-        startIndex, endIndex,
-        currentTime;
+        startIndex, endIndex;
 
     for ( startIndex = byStart.length - 1; startIndex >= 0; startIndex-- ) {
 
@@ -1082,23 +1226,15 @@
     }
 
     // Display track event immediately if it's enabled and current
-    if ( track._natives &&
-        ( !!Popcorn.registryByName[ track._natives.type ] || !!obj[ track._natives.type ] ) ) {
+    if ( track.end > obj.media.currentTime &&
+        track.start <= obj.media.currentTime ) {
 
-      currentTime = obj.media.currentTime;
-      if ( track.end > currentTime &&
-        track.start <= currentTime &&
-        obj.data.disabled.indexOf( track._natives.type ) === -1 ) {
+      track._running = true;
+      obj.data.running[ track._natives.type ].push( track );
 
-        track._running = true;
+      if ( !obj.data.disabled[ track._natives.type ] ) {
+
         track._natives.start.call( obj, null, track );
-
-        if ( obj.options.frameAnimation &&
-          track._natives.frame ) {
-
-          obj.data.trackEvents.animating.push( track );
-          track._natives.frame.call( obj, null, track, currentTime );
-        }
       }
     }
 
@@ -1120,6 +1256,33 @@
     // Store references to user added trackevents in ref table
     if ( track._id ) {
       Popcorn.addTrackEvent.ref( obj, track );
+    }
+
+    // If the call to addTrackEvent was an update/modify call, fire an event
+    if ( isUpdate ) {
+
+      // Determine appropriate event type to trigger
+      // they are identical in function, but the naming
+      // adds some level of intuition for the end developer
+      // to rely on
+      if ( track._natives.type === "cue" ) {
+        eventType = "cuechange";
+      } else {
+        eventType = "trackchange";
+      }
+
+      // Fire an event with change information
+      obj.emit( eventType, {
+        id: track.id,
+        previousValue: {
+          time: trackEvent.start,
+          fn: trackEvent._natives.start
+        },
+        currentValue: {
+          time: track.start,
+          fn: track._natives.start
+        }
+      });
     }
   };
 
@@ -1286,17 +1449,15 @@
     var currentTime = obj.media.currentTime,
         previousTime = obj.data.trackEvents.previousUpdateTime,
         tracks = obj.data.trackEvents,
-        animating = tracks.animating,
         end = tracks.endIndex,
         start = tracks.startIndex,
-        animIndex = 0,
         byStartLen = tracks.byStart.length,
         byEndLen = tracks.byEnd.length,
         registryByName = Popcorn.registryByName,
         trackstart = "trackstart",
         trackend = "trackend",
 
-        byEnd, byStart, byAnimate, natives, type;
+        byEnd, byStart, byAnimate, natives, type, runningPlugins;
 
     //  Playbar advancing
     if ( previousTime <= currentTime ) {
@@ -1313,15 +1474,22 @@
               !!obj[ type ] ) ) {
 
           if ( byEnd._running === true ) {
-            byEnd._running = false;
-            natives.end.call( obj, event, byEnd );
 
-            obj.emit( trackend,
-              Popcorn.extend({}, byEnd, {
-                plugin: type,
-                type: trackend
-              })
-            );
+            byEnd._running = false;
+            runningPlugins = obj.data.running[ type ];
+            runningPlugins.splice( runningPlugins.indexOf( byEnd ), 1 );
+
+            if ( !obj.data.disabled[ type ] ) {
+
+              natives.end.call( obj, event, byEnd );
+
+              obj.emit( trackend,
+                Popcorn.extend({}, byEnd, {
+                  plugin: type,
+                  type: trackend
+                })
+              );
+            }
           }
 
           end++;
@@ -1344,25 +1512,21 @@
               !!obj[ type ] ) ) {
 
           if ( byStart.end > currentTime &&
-                byStart._running === false &&
-                  obj.data.disabled.indexOf( type ) === -1 ) {
+                byStart._running === false ) {
 
             byStart._running = true;
-            natives.start.call( obj, event, byStart );
+            obj.data.running[ type ].push( byStart );
 
-            obj.emit( trackstart,
-              Popcorn.extend({}, byStart, {
-                plugin: type,
-                type: trackstart
-              })
-            );
+            if ( !obj.data.disabled[ type ] ) {
 
-            // If the `frameAnimation` option is used,
-            // push the current byStart object into the `animating` cue
-            if ( obj.options.frameAnimation &&
-                ( byStart && byStart._running && byStart._natives.frame ) ) {
+              natives.start.call( obj, event, byStart );
 
-              animating.push( byStart );
+              obj.emit( trackstart,
+                Popcorn.extend({}, byStart, {
+                  plugin: type,
+                  type: trackstart
+                })
+              );
             }
           }
           start++;
@@ -1370,22 +1534,6 @@
           // remove track event
           Popcorn.removeTrackEvent( obj, byStart._id );
           return;
-        }
-      }
-
-      // If the `frameAnimation` option is used, iterate the animating track
-      // and execute the `frame` callback
-      if ( obj.options.frameAnimation ) {
-        while ( animIndex < animating.length ) {
-
-          byAnimate = animating[ animIndex ];
-
-          if ( !byAnimate._running ) {
-            animating.splice( animIndex, 1 );
-          } else {
-            byAnimate._natives.frame.call( obj, event, byAnimate, currentTime );
-            animIndex++;
-          }
         }
       }
 
@@ -1404,15 +1552,22 @@
               !!obj[ type ] ) ) {
 
           if ( byStart._running === true ) {
-            byStart._running = false;
-            natives.end.call( obj, event, byStart );
 
-            obj.emit( trackend,
-              Popcorn.extend({}, byEnd, {
-                plugin: type,
-                type: trackend
-              })
-            );
+            byStart._running = false;
+            runningPlugins = obj.data.running[ type ];
+            runningPlugins.splice( runningPlugins.indexOf( byStart ), 1 );
+
+            if ( !obj.data.disabled[ type ] ) {
+
+              natives.end.call( obj, event, byStart );
+
+              obj.emit( trackend,
+                Popcorn.extend({}, byStart, {
+                  plugin: type,
+                  type: trackend
+                })
+              );
+            }
           }
           start--;
         } else {
@@ -1434,24 +1589,21 @@
               !!obj[ type ] ) ) {
 
           if ( byEnd.start <= currentTime &&
-                byEnd._running === false  &&
-                  obj.data.disabled.indexOf( type ) === -1 ) {
+                byEnd._running === false ) {
 
             byEnd._running = true;
-            natives.start.call( obj, event, byEnd );
+            obj.data.running[ type ].push( byEnd );
 
-            obj.emit( trackstart,
-              Popcorn.extend({}, byStart, {
-                plugin: type,
-                type: trackstart
-              })
-            );
-            // If the `frameAnimation` option is used,
-            // push the current byEnd object into the `animating` cue
-            if ( obj.options.frameAnimation &&
-                  ( byEnd && byEnd._running && byEnd._natives.frame ) ) {
+            if ( !obj.data.disabled[ type ] ) {
 
-              animating.push( byEnd );
+              natives.start.call( obj, event, byEnd );
+
+              obj.emit( trackstart,
+                Popcorn.extend({}, byEnd, {
+                  plugin: type,
+                  type: trackstart
+                })
+              );
             }
           }
           end--;
@@ -1461,23 +1613,6 @@
           return;
         }
       }
-
-      // If the `frameAnimation` option is used, iterate the animating track
-      // and execute the `frame` callback
-      if ( obj.options.frameAnimation ) {
-        while ( animIndex < animating.length ) {
-
-          byAnimate = animating[ animIndex ];
-
-          if ( !byAnimate._running ) {
-            animating.splice( animIndex, 1 );
-          } else {
-            byAnimate._natives.frame.call( obj, event, byAnimate, currentTime );
-            animIndex++;
-          }
-        }
-      }
-    // time bar is not moving ( video is paused )
     }
 
     tracks.endIndex = end;
@@ -1576,6 +1711,28 @@
         return this;
       }
 
+      // When the "ranges" property is set and its value is an array, short-circuit
+      // the pluginFn definition to recall itself with an options object generated from
+      // each range object in the ranges array. (eg. { start: 15, end: 16 } )
+      if ( options.ranges && Popcorn.isArray(options.ranges) ) {
+        Popcorn.forEach( options.ranges, function( range ) {
+          // Create a fresh object, extend with current options
+          // and start/end range object's properties
+          // Works with in/out as well.
+          var opts = Popcorn.extend( {}, options, range );
+
+          // Remove the ranges property to prevent infinitely
+          // entering this condition
+          delete opts.ranges;
+
+          // Call the plugin with the newly created opts object
+          this[ name ]( opts );
+        }, this);
+
+        // Return the Popcorn instance to avoid creating an empty track event
+        return this;
+      }
+
       //  Storing the plugin natives
       var natives = options._natives = {},
           compose = "",
@@ -1589,17 +1746,26 @@
       natives.start = natives.start || natives[ "in" ];
       natives.end = natives.end || natives[ "out" ];
 
+      if ( options.once ) {
+        natives.end = combineFn( natives.end, function() {
+          this.removeTrackEvent( options._id );
+        });
+      }
+
       // extend teardown to always call end if running
       natives._teardown = combineFn(function() {
 
-        var args = slice.call( arguments );
+        var args = slice.call( arguments ),
+            runningPlugins = this.data.running[ natives.type ];
 
         // end function signature is not the same as teardown,
         // put null on the front of arguments for the event parameter
         args.unshift( null );
 
         // only call end if event is running
-        args[ 1 ]._running && natives.end.apply( this, args );
+        args[ 1 ]._running &&
+          runningPlugins.splice( runningPlugins.indexOf( options ), 1 ) &&
+          natives.end.apply( this, args );
       }, natives._teardown );
 
       // default to an empty string if no effect exists
@@ -1662,11 +1828,16 @@
         options.target = manifestOpts && "target" in manifestOpts && manifestOpts.target;
       }
 
+      if ( options._natives ) {
+        // ensure an initial id is there before setup is called
+        options._id = Popcorn.guid( options._natives.type );
+      }
+
       // Trigger _setup method if exists
       options._natives._setup && options._natives._setup.call( this, options );
 
       // Create new track event for this instance
-      Popcorn.addTrackEvent( this, Popcorn.extend( options, options ) );
+      Popcorn.addTrackEvent( this, options );
 
       //  Future support for plugin event definitions
       //  for all of the native events
@@ -1687,15 +1858,55 @@
 
     //  Extend Popcorn.p with new named definition
     //  Assign new named definition
-    Popcorn.p[ name ] = plugin[ name ] = function( options ) {
+    Popcorn.p[ name ] = plugin[ name ] = function( id, options ) {
+      var length = arguments.length,
+          trackEvent, defaults, mergedSetupOpts;
+
+      // Shift arguments based on use case
+      //
+      // Back compat for:
+      // p.plugin( options );
+      if ( id && !options ) {
+        options = id;
+        id = null;
+      } else {
+
+        // Get the trackEvent that matches the given id.
+        trackEvent = this.getTrackEvent( id );
+
+        // If the track event does not exist, ensure that the options
+        // object has a proper id
+        if ( !trackEvent ) {
+          options.id = id;
+
+        // If the track event does exist, merge the updated properties
+        } else {
+
+          options = Popcorn.extend( {}, trackEvent, options );
+
+          Popcorn.addTrackEvent( this, options );
+
+          return this;
+        }
+      }
+
+      this.data.running[ name ] = this.data.running[ name ] || [];
 
       // Merge with defaults if they exist, make sure per call is prioritized
-      var defaults = ( this.options.defaults && this.options.defaults[ name ] ) || {},
-          mergedSetupOpts = Popcorn.extend( {}, defaults, options );
+      defaults = ( this.options.defaults && this.options.defaults[ name ] ) || {};
+      mergedSetupOpts = Popcorn.extend( {}, defaults, options );
 
       return pluginFn.call( this, isfn ? definition.call( this, mergedSetupOpts ) : definition,
                                   mergedSetupOpts );
     };
+
+    // if the manifest parameter exists we should extend it onto the definition object
+    // so that it shows up when calling Popcorn.registry and Popcorn.registryByName
+    if ( manifest ) {
+      Popcorn.extend( definition, {
+        manifest: manifest
+      });
+    }
 
     //  Push into the registry
     var entry = {
@@ -1740,13 +1951,14 @@
 
         // Trigger an error that the instance can listen for
         // and react to
-        this.emit( "error", Popcorn.plugin.errors );
+        this.emit( "pluginerror", Popcorn.plugin.errors );
       }
     };
   }
 
   // Debug-mode flag for plugin development
-  Popcorn.plugin.debug = false;
+  // True for Popcorn development versions, false for stable/tagged versions
+  Popcorn.plugin.debug = ( Popcorn.version === "@" + "VERSION" );
 
   //  removePlugin( type ) removes all tracks of that from all instances of popcorn
   //  removePlugin( obj, type ) removes all tracks of type from obj, where obj is a single instance of popcorn
@@ -1842,6 +2054,65 @@
   };
 
   Popcorn.plugin.effect = Popcorn.effect = Popcorn.compose;
+
+  var rnaiveExpr = /^(?:\.|#|\[)/;
+
+  //  Basic DOM utilities and helpers API. See #1037
+  Popcorn.dom = {
+    debug: false,
+    //  Popcorn.dom.find( selector, context )
+    //
+    //  Returns the first element that matches the specified selector
+    //  Optionally provide a context element, defaults to `document`
+    //
+    //  eg.
+    //  Popcorn.dom.find("video") returns the first video element
+    //  Popcorn.dom.find("#foo") returns the first element with `id="foo"`
+    //  Popcorn.dom.find("foo") returns the first element with `id="foo"`
+    //     Note: Popcorn.dom.find("foo") is the only allowed deviation
+    //           from valid querySelector selector syntax
+    //
+    //  Popcorn.dom.find(".baz") returns the first element with `class="baz"`
+    //  Popcorn.dom.find("[preload]") returns the first element with `preload="..."`
+    //  ...
+    //  See https://developer.mozilla.org/En/DOM/Document.querySelector
+    //
+    //
+    find: function( selector, context ) {
+      var node = null;
+
+      //  Trim leading/trailing whitespace to avoid false negatives
+      selector = selector.trim();
+
+      //  Default context is the `document`
+      context = context || document;
+
+      if ( selector ) {
+        //  If the selector does not begin with "#", "." or "[",
+        //  it could be either a nodeName or ID w/o "#"
+        if ( !rnaiveExpr.test( selector ) ) {
+
+          //  Try finding an element that matches by ID first
+          node = document.getElementById( selector );
+
+          //  If a match was found by ID, return the element
+          if ( node !== null ) {
+            return node;
+          }
+        }
+        //  Assume no elements have been found yet
+        //  Catch any invalid selector syntax errors and bury them.
+        try {
+          node = context.querySelector( selector );
+        } catch ( e ) {
+          if ( Popcorn.dom.debug ) {
+            throw new Error(e);
+          }
+        }
+      }
+      return node;
+    }
+  };
 
   //  Cache references to reused RegExps
   var rparams = /\?/,
@@ -1952,31 +2223,53 @@
 
     var head = document.head || document.getElementsByTagName( "head" )[ 0 ] || document.documentElement,
       script = document.createElement( "script" ),
-      paramStr = url.split( "?" )[ 1 ],
       isFired = false,
       params = [],
-      callback, parts, callparam;
+      rjsonp = /(=)\?(?=&|$)|\?\?/,
+      replaceInUrl, prefix, paramStr, callback, callparam;
 
-    if ( paramStr && !isScript ) {
-      params = paramStr.split( "&" );
-    }
+    if ( !isScript ) {
 
-    if ( params.length ) {
-      parts = params[ params.length - 1 ].split( "=" );
-    }
+      // is there a calback already in the url
+      callparam = url.match( /(callback=[^&]*)/ );
 
-    callback = params.length ? ( parts[ 1 ] ? parts[ 1 ] : parts[ 0 ]  ) : "jsonp";
+      if ( callparam !== null && callparam.length ) {
 
-    if ( !paramStr && !isScript ) {
-      url += "?callback=" + callback;
-    }
+        prefix = callparam[ 1 ].split( "=" )[ 1 ];
 
-    if ( callback && !isScript ) {
+        // Since we need to support developer specified callbacks
+        // and placeholders in harmony, make sure matches to "callback="
+        // aren't just placeholders.
+        // We coded ourselves into a corner here.
+        // JSONP callbacks should never have been
+        // allowed to have developer specified callbacks
+        if ( prefix === "?" ) {
+          prefix = "jsonp";
+        }
 
-      //  If a callback name already exists
-      if ( !!window[ callback ] ) {
-        //  Create a new unique callback name
-        callback = Popcorn.guid( callback );
+        // get the callback name
+        callback = Popcorn.guid( prefix );
+
+        // replace existing callback name with unique callback name
+        url = url.replace( /(callback=[^&]*)/, "callback=" + callback );
+      } else {
+
+        callback = Popcorn.guid( "jsonp" );
+
+        if ( rjsonp.test( url ) ) {
+          url = url.replace( rjsonp, "$1" + callback );
+        }
+
+        // split on first question mark,
+        // this is to capture the query string
+        params = url.split( /\?(.+)?/ );
+
+        // rebuild url with callback
+        url = params[ 0 ] + "?";
+        if ( params[ 1 ] ) {
+          url += params[ 1 ] + "&";
+        }
+        url += "callback=" + callback;
       }
 
       //  Define the JSONP success callback globally
@@ -1985,9 +2278,6 @@
         success && success( data );
         isFired = true;
       };
-
-      //  Replace callback param and callback name
-      url = url.replace( parts.join( "=" ), parts[ 0 ] + "=" + callback );
     }
 
     script.addEventListener( "load",  function() {
@@ -2138,6 +2428,13 @@
   //  ID string matching
   var rIdExp  = /^(#([\w\-\_\.]+))$/;
 
+  var audioExtensions = "ogg|oga|aac|mp3|wav",
+      videoExtensions = "ogg|ogv|mp4|webm",
+      mediaExtensions = audioExtensions + "|" + videoExtensions;
+
+  var audioExtensionRegexp = new RegExp( "^.*\\.(" + audioExtensions + ")($|\\?)" ),
+      mediaExtensionRegexp = new RegExp( "^.*\\.(" + mediaExtensions + ")($|\\?)" );
+
   Popcorn.player = function( name, player ) {
 
     // return early if a player already exists under this name
@@ -2162,9 +2459,7 @@
           events = {},
 
           // The container div of the resource
-          container = document.getElementById( rIdExp.exec( target ) && rIdExp.exec( target )[ 2 ] ) ||
-                        document.getElementById( target ) ||
-                          target,
+          container = typeof target === "string" ? Popcorn.dom.find( target ) : target,
           basePlayer = {},
           timeout,
           popcorn;
@@ -2309,7 +2604,7 @@
         },
         configurable: true
       });
-      
+
       // Adds an event listener to the object
       basePlayer.addEventListener = function( evtName, fn ) {
 
@@ -2403,32 +2698,18 @@
         }
       } else {
 
-        basePlayer.dispatchEvent( "error" );
+        // Asynchronous so that users can catch this event
+        setTimeout( function() {
+          basePlayer.dispatchEvent( "error" );
+        }, 0 );
       }
-
-      // when a custom player is loaded, load basePlayer state into custom player
-      basePlayer.addEventListener( "loadedmetadata", function() {
-
-        // if a player is not ready before currentTime is called, this will set it after it is ready
-        basePlayer.currentTime = currentTime;
-
-        // same as above with volume and muted
-        basePlayer.volume = volume;
-        basePlayer.muted = muted;
-      });
-
-      basePlayer.addEventListener( "loadeddata", function() {
-
-        // if play was called before player ready, start playing video
-        !basePlayer.paused && basePlayer.play();
-      });
 
       popcorn = new Popcorn.p.init( basePlayer, options );
 
       if ( player._teardown ) {
 
         popcorn.destroy = combineFn( popcorn.destroy, function() {
-        
+
           player._teardown.call( basePlayer, options );
         });
       }
@@ -2449,19 +2730,81 @@
     object.__defineSetter__( description, options.set || Popcorn.nop );
   };
 
+  // player queue is to help players queue things like play and pause
+  // HTML5 video's play and pause are asynch, but do fire in sequence
+  // play() should really mean "requestPlay()" or "queuePlay()" and
+  // stash a callback that will play the media resource when it's ready to be played
+  Popcorn.player.playerQueue = function() {
+
+    var _queue = [],
+        _running = false;
+
+    return {
+      next: function() {
+
+        _running = false;
+        _queue.shift();
+        _queue[ 0 ] && _queue[ 0 ]();
+      },
+      add: function( callback ) {
+
+        _queue.push(function() {
+
+          _running = true;
+          callback && callback();
+        });
+
+        // if there is only one item on the queue, start it
+        !_running && _queue[ 0 ]();
+      }
+    };
+  };
+
   // smart will attempt to find you a match, if it does not find a match,
   // it will attempt to create a video element with the source,
   // if that failed, it will throw.
   Popcorn.smart = function( target, src, options ) {
+    var playerType,
+        elementTypes = [ "AUDIO", "VIDEO" ],
+        sourceNode,
+        firstSrc,
+        node = Popcorn.dom.find( target ),
+        i, srcResult,
+        canPlayTypeTester = document.createElement( "video" ),
+        canPlayTypes = {
+          "ogg": "video/ogg",
+          "ogv": "video/ogg",
+          "oga": "audio/ogg",
+          "webm": "video/webm",
+          "mp4": "video/mp4",
+          "mp3": "audio/mp3"
+        };
 
-    var nodeId = rIdExp.exec( target ),
-        playerType,
-        node = nodeId && nodeId.length && nodeId[ 2 ] ?
-                 document.getElementById( nodeId[ 2 ] ) :
-                 target;
+    var canPlayType = function( type ) {
 
-    // Popcorn.smart( video, /* options */ )
-    if ( node.nodeType === "VIDEO" && !src ) {
+      return canPlayTypeTester.canPlayType( canPlayTypes[ type ] );
+    };
+
+    var canPlaySrc = function( src ) {
+
+      srcResult = mediaExtensionRegexp.exec( src );
+
+      if ( !srcResult || !srcResult[ 1 ] ) {
+        return false;
+      }
+
+      return canPlayType( srcResult[ 1 ] );
+    };
+
+    if ( !node ) {
+
+      Popcorn.error( "Specified target " + target + " was not found." );
+      return;
+    }
+
+    // For when no src is defined.
+    // Usually this is a video element with a src already on it.
+    if ( elementTypes.indexOf( node.nodeName ) > -1 && !src ) {
 
       if ( typeof src === "object" ) {
 
@@ -2472,24 +2815,49 @@
       return Popcorn( node, options );
     }
 
-    // for now we loop through and use the first valid player we find.
-    for ( var key in Popcorn.player.registry ) {
+    // if our src is not an array, create an array of one.	
+    if ( typeof( src ) === "string" ) {
 
-      if ( Popcorn.player.registry.hasOwnProperty( key ) ) {
+      src = [ src ];
+    }
 
-        if ( Popcorn.player.registry[ key ].canPlayType( node.nodeName, src ) ) {
+    // go through each src, and find the first playable.
+    // this only covers player sources popcorn knows of,
+    // and not things like a youtube src that is private.
+    // it will still consider a private youtube video to be playable.
+    for ( i = 0, srcLength = src.length; i < srcLength; i++ ) {
 
-          // Popcorn.smart( player, src, /* options */ )
-          return Popcorn[ key ]( target, src, options );
+      // src is a playable HTML5 video, we don't need to check custom players.
+      if ( canPlaySrc( src[ i ] ) ) {
+
+        src = src[ i ];
+        break;
+      }
+
+      // for now we loop through and use the first valid player we find.
+      for ( var key in Popcorn.player.registry ) {
+
+        if ( Popcorn.player.registry.hasOwnProperty( key ) ) {
+
+          if ( Popcorn.player.registry[ key ].canPlayType( node.nodeName, src[ i ] ) ) {
+
+            // Popcorn.smart( player, src, /* options */ )
+            return Popcorn[ key ]( node, src[ i ], options );
+          }
         }
       }
     }
 
     // Popcorn.smart( div, src, /* options */ )
     // attempting to create a video in a container
-    if ( node.nodeType !== "VIDEO" ) {
+    if ( elementTypes.indexOf( node.nodeName ) === -1 ) {
 
-      target = document.createElement( "video" );
+      firstSrc = typeof( src ) === "string" ? src : src.length ? src[ 0 ] : src;
+
+      target = document.createElement( !!audioExtensionRegexp.exec( firstSrc ) ? elementTypes[ 0 ] : elementTypes[ 1 ] );
+
+      // Controls are defaulted to being present
+      target.controls = true;
 
       node.appendChild( target );
       node = target;
@@ -2499,242 +2867,79 @@
     node.src = src;
 
     return Popcorn( node, options );
+
+  };
+})( Popcorn );
+(function( window, Popcorn ) {
+  // A global callback for youtube... that makes me angry
+  window.onYouTubePlayerAPIReady = function() {
+
+    onYouTubePlayerAPIReady.ready = true;
+    for ( var i = 0; i < onYouTubePlayerAPIReady.waiting.length; i++ ) {
+      onYouTubePlayerAPIReady.waiting[ i ]();
+    }
   };
 
-})( Popcorn );
-// A global callback for youtube... that makes me angry
-var onYouTubePlayerReady = function( containerId ) {
+  // existing youtube references can break us.
+  // remove it and use the one we can trust.
+  if ( window.YT ) {
+    window.quarantineYT = window.YT;
+    window.YT = null;
+  }
 
-  onYouTubePlayerReady[ containerId ] && onYouTubePlayerReady[ containerId ]();
-};
-onYouTubePlayerReady.stateChangeEventHandler = {};
-onYouTubePlayerReady.onErrorEventHandler = {};
+  onYouTubePlayerAPIReady.waiting = [];
 
-Popcorn.player( "youtube", {
-  _canPlayType: function( nodeName, url ) {
+  var _loading = false;
 
-    return (/(?:http:\/\/www\.|http:\/\/|www\.|\.|^)(youtu)/).test( url ) && nodeName.toLowerCase() !== "video";
-  },
-  _setup: function( options ) {
+  Popcorn.player( "youtube", {
+    _canPlayType: function( nodeName, url ) {
 
-    var media = this,
-        autoPlay = false,
-        container = document.createElement( "div" ),
-        currentTime = 0,
-        seekTime = 0,
-        firstGo = true,
-        seeking = false,
+      return typeof url === "string" && (/(?:http:\/\/www\.|http:\/\/|www\.|\.|^)(youtu)/).test( url ) && nodeName.toLowerCase() !== "video";
+    },
+    _setup: function( options ) {
+      if ( !window.YT && !_loading ) {
+        _loading = true;
+        Popcorn.getScript( "//youtube.com/player_api" );
+      }
 
-        // state code for volume changed polling
-        volumeChanged = false,
-        lastMuted = false,
-        lastVolume = 100;
+      var media = this,
+          autoPlay = false,
+          container = document.createElement( "div" ),
+          currentTime = 0,
+          paused = true,
+          seekTime = 0,
+          firstGo = true,
+          seeking = false,
+          fragmentStart = 0,
 
-    // setting paused to undefined because youtube has state for not paused or playing
-    media.paused = undefined;
-    container.id = media.id + Popcorn.guid();
+          // state code for volume changed polling
+          lastMuted = false,
+          lastVolume = 100,
+          playerQueue = Popcorn.player.playerQueue();
 
-    options._container = container;
-
-    media.appendChild( container );
-
-    var youtubeInit = function() {
-
-      var flashvars,
-          params,
-          attributes,
-          src,
-          width,
-          height,
-          query;
-
-      // expose a callback to this scope, that is called from the global callback youtube calls
-      onYouTubePlayerReady[ container.id ] = function() {
-
-        options.youtubeObject = document.getElementById( container.id );
-
-        // more youtube callback nonsense
-        onYouTubePlayerReady.stateChangeEventHandler[ container.id ] = function( state ) {
-
-          if ( options.destroyed ) {
-
-            return;
-          }
-
-          // youtube fires paused events while seeking
-          // this is the only way to get seeking events
-          if ( state === 2 ) {
-
-            // silly logic forced on me by the youtube API
-            // calling youtube.seekTo triggers multiple events
-            // with the second events getCurrentTime being the old time
-            if ( seeking && seekTime === currentTime && seekTime !== options.youtubeObject.getCurrentTime() ) {
-
-              seeking = false;
-              options.youtubeObject.seekTo( currentTime );
-              return;
-            }
-
-            currentTime = options.youtubeObject.getCurrentTime();
-            media.dispatchEvent( "timeupdate" );
-            !media.paused && media.pause();
-
-            return;
-          } else
-          // playing is state 1
-          // paused is state 2
-          if ( state === 1 && !firstGo ) {
-
-            media.paused && media.play();
-            return;
-          } else
-          // this is the real player ready check
-          // -1 is for unstarted, but ready to go videos
-          // before this the player object exists, but calls to it may go unheard
-          if ( state === -1 ) {
-
-            options.youtubeObject.playVideo();
-            return;
-          } else
-          if ( state === 1 && firstGo ) {
-
-            firstGo = false;
-
-            if ( media.paused === true ) {
-
-              media.pause();
-            } else if ( media.paused === false ) {
-
-              media.play();
-            } else if ( autoPlay ) {
-
-              media.play();
-            } else if ( !autoPlay ) {
-
-              media.pause();
-            }
-
-            media.duration = options.youtubeObject.getDuration();
-
-            media.dispatchEvent( "durationchange" );
-            volumeupdate();
-
-            media.dispatchEvent( "loadedmetadata" );
-            media.dispatchEvent( "loadeddata" );
-
-            media.readyState = 4;
-            media.dispatchEvent( "canplaythrough" );
-
-            return;
-          } else if ( state === 0 ) {
-            media.dispatchEvent( "ended" );
-          }
-        };
-
-        onYouTubePlayerReady.onErrorEventHandler[ container.id ] = function( errorCode ) {
-          if ( [ 2, 100, 101, 150 ].indexOf( errorCode ) !== -1 ) {
-            media.dispatchEvent( "error" );
-          }
-        };
-
-        // youtube requires callbacks to be a string to a function path from the global scope
-        options.youtubeObject.addEventListener( "onStateChange", "onYouTubePlayerReady.stateChangeEventHandler." + container.id );
-
-        options.youtubeObject.addEventListener( "onError", "onYouTubePlayerReady.onErrorEventHandler." + container.id );
-
-        var timeupdate = function() {
-
-          if ( options.destroyed ) {
-
-            return;
-          }
-
-          if ( !media.paused ) {
-
-            currentTime = options.youtubeObject.getCurrentTime();
-            media.dispatchEvent( "timeupdate" );
-            setTimeout( timeupdate, 10 );
-          }
-        };
-
-        var volumeupdate = function() {
-
-          if ( options.destroyed ) {
-
-            return;
-          }
-
-          if ( lastMuted !== options.youtubeObject.isMuted() ) {
-
-            lastMuted = options.youtubeObject.isMuted();
-            media.dispatchEvent( "volumechange" );
-          }
-
-          if ( lastVolume !== options.youtubeObject.getVolume() ) {
-
-            lastVolume = options.youtubeObject.getVolume();
-            media.dispatchEvent( "volumechange" );
-          }
-
-          setTimeout( volumeupdate, 250 );
-        };
-
-        media.play = function() {
-
-          if ( options.destroyed ) {
-
-            return;
-          }
-
-          if ( media.paused !== false || options.youtubeObject.getPlayerState() !== 1 ) {
-
-            media.paused = false;
-            media.dispatchEvent( "play" );
-
-            media.dispatchEvent( "playing" );
-          }
-
-          timeupdate();
-          options.youtubeObject.playVideo();
-        };
-
-        media.pause = function() {
-
-          if ( options.destroyed ) {
-
-            return;          
-          }
-
-          if ( media.paused !== true || options.youtubeObject.getPlayerState() !== 2 ) {
-
-            media.paused = true;
-            media.dispatchEvent( "pause" );
-            options.youtubeObject.pauseVideo();
-          }
-        };
+      var createProperties = function() {
 
         Popcorn.player.defineProperty( media, "currentTime", {
           set: function( val ) {
 
-            // make sure val is a number
-            currentTime = seekTime = +val;
-            seeking = true;
-
             if ( options.destroyed ) {
-
-              return currentTime;
+              return;
             }
 
-            media.dispatchEvent( "seeked" );
-            media.dispatchEvent( "timeupdate" );
-
-            options.youtubeObject.seekTo( currentTime );
-
-            return currentTime;
+            seeking = true;
+            // make sure val is a number
+            currentTime = Math.round( +val * 100 ) / 100;
           },
           get: function() {
 
             return currentTime;
+          }
+        });
+
+        Popcorn.player.defineProperty( media, "paused", {
+          get: function() {
+
+            return paused;
           }
         });
 
@@ -2800,50 +3005,246 @@ Popcorn.player( "youtube", {
             return options.youtubeObject.getVolume() / 100;
           }
         });
+
+        media.play = function() {
+
+          if ( options.destroyed ) {
+
+            return;
+          }
+
+          paused = false;
+          playerQueue.add(function() {
+
+            if ( options.youtubeObject.getPlayerState() !== 1 ) {
+
+              seeking = false;
+              options.youtubeObject.playVideo();
+            } else {
+              playerQueue.next();
+            }
+          });
+        };
+
+        media.pause = function() {
+
+          if ( options.destroyed ) {
+
+            return;
+          }
+
+          paused = true;
+          playerQueue.add(function() {
+
+            if ( options.youtubeObject.getPlayerState() !== 2 ) {
+
+              options.youtubeObject.pauseVideo();
+            } else {
+              playerQueue.next();
+            }
+          });
+        };
       };
 
-      options.controls = +options.controls === 0 || +options.controls === 1 ? options.controls : 1;
-      options.annotations = +options.annotations === 1 || +options.annotations === 3 ? options.annotations : 1;
+      container.id = media.id + Popcorn.guid();
+      options._container = container;
+      media.appendChild( container );
 
-      flashvars = {
-        playerapiid: container.id
+      var youtubeInit = function() {
+
+        var src, query, params, playerVars, queryStringItem, firstPlay = true;
+
+        var timeUpdate = function() {
+
+          if ( options.destroyed ) {
+            return;
+          }
+
+          if ( !seeking ) {
+            currentTime = options.youtubeObject.getCurrentTime();
+            media.dispatchEvent( "timeupdate" );
+          } else if ( currentTime === options.youtubeObject.getCurrentTime() ) {
+
+            seeking = false;
+            media.dispatchEvent( "seeked" );
+            media.dispatchEvent( "timeupdate" );
+          } else {
+
+            // keep trying the seek until it is right.
+            options.youtubeObject.seekTo( currentTime );
+          }
+          setTimeout( timeUpdate, 250 );
+        };
+
+        // delay is in seconds
+        var fetchDuration = function( delay ) {
+          var ytDuration = options.youtubeObject.getDuration();
+
+          if ( isNaN( ytDuration ) || ytDuration === 0 ) {
+            setTimeout( function() {
+              fetchDuration( delay * 2 );
+            }, delay*1000 );
+          } else {
+            // set duration and dispatch ready events
+            media.duration = ytDuration;
+            media.dispatchEvent( "durationchange" );
+            
+            media.dispatchEvent( "loadedmetadata" );
+            media.dispatchEvent( "loadeddata" );
+            
+            media.readyState = 4;
+
+            timeUpdate();
+            media.dispatchEvent( "canplaythrough" );
+          }
+        };
+
+        options.controls = +options.controls === 0 || +options.controls === 1 ? options.controls : 1;
+        options.annotations = +options.annotations === 1 || +options.annotations === 3 ? options.annotations : 1;
+
+        src = /^.*(?:\/|v=)(.{11})/.exec( media.src )[ 1 ];
+
+        query = ( media.src.split( "?" )[ 1 ] || "" )
+                           .replace( /v=.{11}/, "" );
+        query = query.replace( /&t=(?:(\d+)m)?(?:(\d+)s)?/, function( all, minutes, seconds ) {
+
+          // Make sure we have real zeros
+          minutes = minutes | 0; // bit-wise OR
+          seconds = seconds | 0; // bit-wise OR
+
+          fragmentStart = ( +seconds + ( minutes * 60 ) );
+          return "";
+        });
+        query = query.replace( /&start=(\d+)?/, function( all, seconds ) {
+
+          // Make sure we have real zeros
+          seconds = seconds | 0; // bit-wise OR
+
+          fragmentStart = seconds;
+          return "";
+        });
+
+        autoPlay = ( /autoplay=1/.test( query ) );
+
+        params = query.split( /[\&\?]/g );
+        playerVars = { wmode: "transparent" };
+
+        for( var i = 0; i < params.length; i++ ) {
+          queryStringItem = params[ i ].split( "=" );
+          playerVars[ queryStringItem[ 0 ] ] = queryStringItem[ 1 ];
+        }
+        
+        options.youtubeObject = new YT.Player( container.id, {
+          height: "100%",
+          width: "100%",
+          wmode: "transparent",
+          playerVars: playerVars,
+          videoId: src,
+          events: {
+            "onReady": function(){
+
+              // pulling initial volume states form baseplayer
+              lastVolume = media.volume;
+              lastMuted = media.muted;
+
+              volumeupdate();
+
+              paused = media.paused;
+              createProperties();
+              options.youtubeObject.playVideo();
+
+              media.currentTime = fragmentStart;
+              // wait to dispatch ready events until we get a duration
+            },
+            "onStateChange": function( state ){
+
+              if ( options.destroyed || state.data === -1 ) {
+                return;
+              }
+
+              // state.data === 2 is for pause events
+              // state.data === 1 is for play events
+              if ( state.data === 2 ) {
+                paused = true;
+                media.dispatchEvent( "pause" );
+                playerQueue.next();
+              } else if ( state.data === 1 && !firstPlay ) {
+                paused = false;
+                media.dispatchEvent( "play" );
+                media.dispatchEvent( "playing" );
+                playerQueue.next();
+              } else if ( state.data === 0 ) {
+                media.dispatchEvent( "ended" );
+              } else if ( state.data === 1 && firstPlay ) {
+                firstPlay = false;
+
+                // pulling initial paused state from autoplay or the baseplayer
+                // also need to explicitly set to paused otherwise.
+                if ( autoPlay || !media.paused ) {
+                  paused = false;
+                }
+
+                if ( paused ) {
+                  options.youtubeObject.pauseVideo();
+                }
+                
+                fetchDuration( 0.025 );
+              }
+            },
+            "onError": function( error ) {
+
+              if ( [ 2, 100, 101, 150 ].indexOf( error.data ) !== -1 ) {
+                media.error = {
+                  customCode: error.data
+                };
+                media.dispatchEvent( "error" );
+              }
+            }
+          }
+        });
+
+        var volumeupdate = function() {
+
+          if ( options.destroyed ) {
+
+            return;
+          }
+
+          if ( lastMuted !== options.youtubeObject.isMuted() ) {
+
+            lastMuted = options.youtubeObject.isMuted();
+            media.dispatchEvent( "volumechange" );
+          }
+
+          if ( lastVolume !== options.youtubeObject.getVolume() ) {
+
+            lastVolume = options.youtubeObject.getVolume();
+            media.dispatchEvent( "volumechange" );
+          }
+
+          setTimeout( volumeupdate, 250 );
+        };
       };
 
-      params = {
-        wmode: "transparent",
-        allowScriptAccess: "always"
-      };
+      if ( onYouTubePlayerAPIReady.ready ) {
 
-      src = /^.*(?:\/|v=)(.{11})/.exec( media.src )[ 1 ];
+        youtubeInit();
+      } else {
 
-      query = ( media.src.split( "?" )[ 1 ] || "" ).replace( /v=.{11}/, "" );
-      autoPlay = ( /autoplay=1/.test( query ) );
+        onYouTubePlayerAPIReady.waiting.push( youtubeInit );
+      }
+    },
+    _teardown: function( options ) {
 
-      // setting youtube player's height and width, default to 560 x 315
-      width = media.style.width ? "" + media.offsetWidth : "560";
-      height = media.style.height ? "" + media.offsetHeight : "315";
+      options.destroyed = true;
 
-      attributes = {
-        id: container.id,
-        "data-youtube-player": "//www.youtube.com/e/" + src + "?" + query + "&enablejsapi=1&playerapiid=" + container.id + "&version=3"
-      };
+      var youtubeObject = options.youtubeObject;
+      if( youtubeObject ){
+        youtubeObject.stopVideo();
+        youtubeObject.clearVideo && youtubeObject.clearVideo();
+      }
 
-      swfobject.embedSWF( attributes[ "data-youtube-player" ], container.id, width, height, "8", undefined, flashvars, params, attributes );
-    };
-
-    if ( !window.swfobject ) {
-
-      Popcorn.getScript( "//ajax.googleapis.com/ajax/libs/swfobject/2.2/swfobject.js", youtubeInit );
-    } else {
-
-      youtubeInit();
+      this.removeChild( document.getElementById( options._container.id ) );
     }
-  },
-  _teardown: function( options ) {
-
-    options.destroyed = true;
-    options.youtubeObject.stopVideo();
-    options.youtubeObject.clearVideo();
-    this.removeChild( document.getElementById( options._container.id ) );
-  }
-});
+  });
+}( window, Popcorn ));
